@@ -1,9 +1,11 @@
+# 🔐 ByteEye - Endpoint Detection & Response (Self-Hosted)  
+*Short for “Endpoint + Orchestrated Security”*
+
 <p align="center">
   <img src="./assets/byteeye-logo.png" width="300" alt="ByteEye Logo"/>
 </p>
 
-# 🔐 ByteEye - Endpoint Detection & Response (Self-Hosted)  
-*Short for “Endpoint + Orchestrated Security”*
+
 
 ByteEye is a fully self-hosted, open-source Endpoint Detection and Response system designed for local environments, homelabs, or small-scale enterprise use. It provides active threat detection, secure log collection, and real-time visibility across your endpoints without sending data to any third-party cloud providers.
 
