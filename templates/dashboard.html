@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Byteye XDR Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+  <div class="container mt-5">
+    <h1>Byteye XDR Dashboard</h1>
+    <p class="lead">Active Agents Overview</p>
+    <div id="agentList">
+      {% if agents %}
+        <div class="list-group">
+          {% for agent in agents %}
+            <a href="{{ url_for('agent_detail', agent_id=agent) }}" class="list-group-item list-group-item-action">
+              Agent: {{ agent }}
+            </a>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="alert alert-warning">No active agents.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Include Socket.IO client library -->
+  <script src="https://cdn.socket.io/4.4.1/socket.io.min.js" integrity="sha384-fZjAQlVaSXhZqkbvC7g9e2ZQgU4dpAmNhm6NVA2N2mUgXCr2S2z3g5/HYF6nk9s5" crossorigin="anonymous"></script>
+  <script>
+    var socket = io();
+    
+    // When an agent connects, refresh the agent list.
+    socket.on("agent_connected", function(data) {
+      console.log("Agent connected:", data.agent);
+      // For simplicity, reload the page.
+      location.reload();
+    });
+    
+    // When an agent disconnects, refresh the agent list.
+    socket.on("agent_disconnected", function(data) {
+      console.log("Agent disconnected:", data.agent);
+      location.reload();
+    });
+    
+    // Log new events to the console.
+    socket.on("new_event", function(data) {
+      console.log("New event for agent " + data.agent, data.event);
+      // If desired, you can add more complex UI updates here.
+    });
+  </script>
+</body>
+</html>
