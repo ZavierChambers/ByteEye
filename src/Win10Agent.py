@@ -1,86 +1,130 @@
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-import psutil
-import json
-import socket
+#!/usr/bin/env python
+"""
+Byteye XDR Agent - Windows Edition (Enhanced)
+============================================================
+Author: Zavier Chambers (upgraded version by IT Guy)
+Description:
+    This version of the Byteye agent has been reworked into a
+    multi-threaded client that gathers endpoint events and sends
+    them in real time to a centralized server. Key features include:
+    - Process scanning with network connection tracking.
+    - File system event monitoring with watchdog.
+    - Windows registry monitoring.
+    - Outbound network connection logging.
+    - A centralized event queue for inter-thread communication.
+    - A sender thread that maintains a persistent connection
+      to the server for event transmission.
+    
+Version: Updated 04/11/2025
+"""
+
 import os
+import json
 import time
+import socket
+import psutil
+import winreg
 import logging
 import threading
-import winreg
+import queue
 from datetime import datetime
-
-'''
--------------------------------------------------
-    ByteEye EDR Agent - by Zavier Chambers
-
-    Description:
-    This is the main client-side monitoring agent for ByteEye,
-    a lightweight endpoint detection and response system.
-
-    Features include:
-    - Process scanning with network connection tracking
-    - File system event monitoring
-    - Windows registry monitoring
-    - Outbound network connection logging
-
-    Built for security researchers and defenders.
-    Version: Windows Edition (Initial Build: 4/2/2025)
--------------------------------------------------
-'''
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # -----------------------------
-# Startup Initialization Block
+# Configuration & Globals
 # -----------------------------
+# Update these as needed for your server
+SERVER_IP = "127.0.0.1"  # Replace with actual server IP
+SERVER_PORT = 9000       # Replace with desired port
 
-# Start time header for logs
-start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-start_message = f"[ByteEye Agent Started] {start_time}\n"
+# Delay (in seconds) before retrying connection on error.
+RECONNECT_DELAY = 5
 
-# Safely initialize the process JSON file
-# Prevents errors when GUI loads if file is missing or malformed
-
-def ensure_valid_json(filepath, default):
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(default, f, indent=4)
-
-ensure_valid_json("processinfo.txt", [{
-    "name": "ByteEye Agent Startup",
-    "pid": 0,
-    "username": "system",
-    "net_connections": []
-}])
-
-# Initialize log files if they are missing or empty
-for log_file in ["file_events.log", "registry_events.log", "network_events.log"]:
-    if not os.path.exists(log_file) or os.stat(log_file).st_size == 0:
-        with open(log_file, "w", encoding="utf-8") as f:
-            f.write(start_message)
+# Define a thread-safe queue for events
+event_queue = queue.Queue()
 
 # -----------------------------
-# Logging Setup
+# Utility Functions
 # -----------------------------
-
-# Set up logger for registry events
-registry_logger = logging.getLogger("RegistryLogger")
-registry_logger.setLevel(logging.INFO)
-reg_handler = logging.FileHandler("registry_events.log", encoding="utf-8")
-reg_formatter = logging.Formatter('%(asctime)s - %(message)s')
-reg_handler.setFormatter(reg_formatter)
-registry_logger.addHandler(reg_handler)
+def send_event(event_type, data):
+    """
+    Packages event data with a timestamp and type, then places it
+    into the global event_queue for transmission.
+    
+    Terms:
+    - event_type: A string to label the type of event.
+    - data: The event payload (it can be a dict or string).
+    """
+    event = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "type": event_type,
+        "data": data
+    }
+    event_queue.put(event)
 
 # -----------------------------
-# Registry Monitoring Thread
+# Process and Network Tracker
+# -----------------------------
+def processScanning():
+    """
+    Scans and collects the list of running processes with details:
+    process name, process ID (pid), username, and any active network connections.
+    
+    The gathered data is then enqueued for transmission.
+    """
+    while True:
+        processes = []
+        for process in psutil.process_iter(['pid', 'name', 'username']):
+            try:
+                if process.pid == 0:
+                    continue
+                
+                proc_info = {
+                    "name": process.info.get("name"),
+                    "pid": process.info.get("pid"),
+                    "username": process.info.get("username"),
+                    "net_connections": []
+                }
+                
+                # Gather each network connection for the process
+                for conn in process.net_connections(kind='inet'):
+                    conn_type = 'TCP' if conn.type == socket.SOCK_STREAM else 'UDP'
+                    if conn.laddr:
+                        ip = conn.laddr.ip
+                        port = conn.laddr.port
+                    else:
+                        ip = ""
+                        port = 0
+                    proc_info["net_connections"].append({
+                        "type": conn_type,
+                        "ip": ip,
+                        "port": port,
+                        "status": conn.status
+                    })
+                processes.append(proc_info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        
+        send_event("process_scan", processes)
+        time.sleep(10)  # Scanning interval
+
+# -----------------------------
+# Registry Monitor
 # -----------------------------
 def registryMonitor():
+    """
+    Monitors specific Windows registry paths for changes, additions, or deletions.
+    When a change is detected, it enqueues a registry event.
+    
+    New Terms:
+    - hive: A Windows registry hive, such as HKEY_CURRENT_USER.
+    - REGISTRY_EXCLUDE_LIST: A list of registry entries to ignore.
+    """
     REG_PATHS = [
-        (winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\\CurrentControlSet\\Services"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services")
     ]
 
     REGISTRY_EXCLUDE_LIST = [
@@ -121,109 +165,77 @@ def registryMonitor():
                 if is_excluded(name):
                     continue
                 if name not in previous_values:
-                    registry_logger.info(f"[REGISTRY][NEW] {path} -> {name} = {value}")
+                    event_msg = f"[NEW] {path} -> {name} = {value}"
+                    send_event("registry_event", event_msg)
                 elif previous_values[name] != value:
-                    registry_logger.info(f"[REGISTRY][MODIFIED] {path} -> {name} changed to {value}")
+                    event_msg = f"[MODIFIED] {path} -> {name} changed to {value}"
+                    send_event("registry_event", event_msg)
 
             for name in previous_values:
                 if is_excluded(name):
                     continue
                 if name not in current_values:
-                    registry_logger.info(f"[REGISTRY][DELETED] {path} -> {name} was removed")
+                    event_msg = f"[DELETED] {path} -> {name} was removed"
+                    send_event("registry_event", event_msg)
 
             last_snapshot[key_id] = current_values
-
-        time.sleep(5)
-
-# -----------------------------
-# Process and Network Tracker
-# -----------------------------
-def processScanning():
-    while True:
-        buffer = []
-
-        for process in psutil.process_iter(['pid', 'name', 'username']):
-            try:
-                if process.pid == 0:
-                    continue
-
-                proc_info = {
-                    'name': process.info.get('name'),
-                    'pid': process.info.get('pid'),
-                    'username': process.info.get('username'),
-                    'net_connections': []
-                }
-
-                for conn in process.net_connections(kind='inet'):
-                    conn_type = 'TCP' if conn.type == socket.SOCK_STREAM else 'UDP'
-                    laddr_ip = conn.laddr.ip if conn.laddr else ''
-                    laddr_port = conn.laddr.port if conn.laddr else 0
-
-                    proc_info['net_connections'].append({
-                        'type': conn_type,
-                        'ip': laddr_ip,
-                        'port': laddr_port,
-                        'status': conn.status
-                    })
-
-                buffer.append(proc_info)
-
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-
-        with open('processinfo.txt', 'w', encoding='utf-8') as processfile:
-            json.dump(buffer, processfile, indent=4)
-
-        time.sleep(10)
+        time.sleep(5)  # Registry scan interval
 
 # -----------------------------
 # File System Monitor
 # -----------------------------
 def activeScanFileSystem():
-    logging.basicConfig(filename='file_events.log', level=logging.INFO, format='%(asctime)s - %(message)s')
-
+    """
+    Uses watchdog to monitor the file system for changes (creation, deletion,
+    modification, and move events). Instead of writing to a file, events are
+    enqueued for the sender thread.
+    
+    New Terms:
+    - watchdog: A Python library for monitoring file system events.
+    - ByteEyeFileHandler: Custom handler extending FileSystemEventHandler.
+    """
     EXCLUDE_DIRS = [
         "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
         "C:\\$Recycle.Bin", "C:\\System Volume Information",
-        "C:\\Users\\Zavie\\AppData", "C:\\ByteEye",
-        "C:\\ProgramData\\NVIDIA Corporation", "C:\\ProgramData\\USOPrivate",
-        " C:\\ProgramData\\Microsoft\\Windows", "C:\\ProgramData\\Lenovo",
-        "C:\\Users\\Zavie\\.vscode"
+        "C:\\ByteEye", "C:\\ProgramData\\NVIDIA Corporation", "C:\\ProgramData\\USOPrivate",
+        "C:\\ProgramData\\Microsoft\\Windows", "C:\\ProgramData\\Lenovo"
     ]
 
     class ByteEyeFileHandler(FileSystemEventHandler):
         def on_created(self, event):
-            logging.info(f"[CREATED] {event.src_path}")
+            send_event("file_event", f"[CREATED] {event.src_path}")
 
         def on_deleted(self, event):
-            logging.info(f"[DELETED] {event.src_path}")
+            send_event("file_event", f"[DELETED] {event.src_path}")
 
         def on_modified(self, event):
-            logging.info(f"[MODIFIED] {event.src_path}")
+            send_event("file_event", f"[MODIFIED] {event.src_path}")
 
         def on_moved(self, event):
-            logging.info(f"[MOVED] from {event.src_path} to {event.dest_path}")
+            send_event("file_event", f"[MOVED] from {event.src_path} to {event.dest_path}")
 
     def should_exclude(path):
         path = os.path.abspath(path)
-        return any(os.path.commonpath([path, os.path.abspath(excluded)]) == os.path.abspath(excluded)
-                   for excluded in EXCLUDE_DIRS)
+        for excluded in EXCLUDE_DIRS:
+            if os.path.commonpath([path, os.path.abspath(excluded)]) == os.path.abspath(excluded):
+                return True
+        return False
 
     observer = Observer()
     event_handler = ByteEyeFileHandler()
 
     for dirpath, dirnames, _ in os.walk("C:\\"):
         if should_exclude(dirpath):
+            # Prevent recursive descent into excluded directories.
             dirnames[:] = []
             continue
-
         try:
             observer.schedule(event_handler, path=dirpath, recursive=False)
         except Exception as e:
-            logging.warning(f"Failed to monitor {dirpath}: {e}")
+            print(f"Failed to monitor {dirpath}: {e}")
 
     observer.start()
-    print(f"[+] File system monitoring started on C:\\ (exclusions applied)")
+    print("[+] File system monitoring started on C:\\ (exclusions applied)")
 
     try:
         while True:
@@ -231,18 +243,24 @@ def activeScanFileSystem():
     except KeyboardInterrupt:
         observer.stop()
         print("[!] File monitor stopped.")
-
     observer.join()
 
 # -----------------------------
 # Outbound Network Monitor
 # -----------------------------
 def networkMonitor():
+    """
+    Monitors outbound network connections from processes. On detecting a new,
+    established connection, the event (including process details and remote host)
+    is enqueued.
+    
+    New Terms:
+    - outbound network connection: A connection initiated from the host to an external server.
+    - known_connections: A set to track connections already logged.
+    """
     known_connections = set()
 
     while True:
-        log_entries = []
-
         for proc in psutil.process_iter(['pid', 'name']):
             try:
                 conns = proc.net_connections(kind='inet')
@@ -252,18 +270,16 @@ def networkMonitor():
 
                     laddr = f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else ""
                     raddr = f"{conn.raddr.ip}:{conn.raddr.port}"
-
                     conn_id = (proc.info['pid'], raddr)
+
                     if conn_id not in known_connections:
                         known_connections.add(conn_id)
-
                         try:
                             hostname = socket.gethostbyaddr(conn.raddr.ip)[0]
-                        except:
+                        except Exception:
                             hostname = "N/A"
-
-                        log_entry = {
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        
+                        event_data = {
                             "process": proc.info['name'],
                             "pid": proc.info['pid'],
                             "local_address": laddr,
@@ -271,40 +287,62 @@ def networkMonitor():
                             "hostname": hostname,
                             "status": conn.status
                         }
-
-                        log_entries.append(log_entry)
-
+                        send_event("network_event", event_data)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
-
-        if log_entries:
-            with open("network_events.log", "a", encoding="utf-8") as f:
-                for entry in log_entries:
-                    f.write(
-                        f"[{entry['timestamp']}] {entry['process']} (PID: {entry['pid']}) "
-                        f"-> {entry['remote_address']} ({entry['hostname']}) Status: {entry['status']}\n"
-                    )
-
         time.sleep(5)
+
+# -----------------------------
+# Data Sender Thread
+# -----------------------------
+def dataSender():
+    """
+    Maintains a persistent connection with the central server and sends
+    events from the event_queue. The data is sent in a simple protocol where
+    the length (4 bytes, big-endian) of the JSON payload is sent first,
+    followed by the actual JSON-encoded event.
+    
+    New Terms:
+    - persistent connection: A continuously maintained network connection.
+    - protocol: Here, a simple method for transmitting data (length prefix + data).
+    """
+    while True:
+        try:
+            with socket.create_connection((SERVER_IP, SERVER_PORT)) as s:
+                print("[*] Connected to server at {}:{}".format(SERVER_IP, SERVER_PORT))
+                while True:
+                    event = event_queue.get()
+                    # Convert event data to JSON bytes
+                    data = json.dumps(event).encode('utf-8')
+                    # Send message length first (4 bytes)
+                    s.sendall(len(data).to_bytes(4, byteorder='big'))
+                    # Then send the actual event data
+                    s.sendall(data)
+        except Exception as e:
+            print(f"[!] Connection error: {e}. Retrying in {RECONNECT_DELAY} seconds")
+            time.sleep(RECONNECT_DELAY)
 
 # -----------------------------
 # Main Thread Runner
 # -----------------------------
 if __name__ == "__main__":
-    t1 = threading.Thread(target=processScanning, daemon=True)
-    t2 = threading.Thread(target=activeScanFileSystem, daemon=True)
-    t3 = threading.Thread(target=registryMonitor, daemon=True)
-    t4 = threading.Thread(target=networkMonitor, daemon=True)
+    # Create daemon threads for each monitoring component
+    t_process = threading.Thread(target=processScanning, daemon=True)
+    t_registry = threading.Thread(target=registryMonitor, daemon=True)
+    t_filesystem = threading.Thread(target=activeScanFileSystem, daemon=True)
+    t_network = threading.Thread(target=networkMonitor, daemon=True)
+    t_sender = threading.Thread(target=dataSender, daemon=True)
 
-    t1.start()
-    t2.start()
-    t3.start()
-    t4.start()
+    # Start all threads
+    t_process.start()
+    t_registry.start()
+    t_filesystem.start()
+    t_network.start()
+    t_sender.start()
 
-    print("[*] ByteEye Agent Running... Press Ctrl+C to stop.")
-
+    print("[*] Byteye XDR Agent Running... Press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("[!] Stopping ByteEye Agent.")
+        print("[!] Stopping Byteye XDR Agent.")
