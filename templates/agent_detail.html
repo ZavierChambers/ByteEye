@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Agent {{ agent_id }} Details</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+  <style>
+    pre {
+      background-color: #f8f9fa;
+      padding: 10px;
+      border-radius: 5px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="container mt-5">
+    <h1 class="mb-4">Agent {{ agent_id }} Details</h1>
+    {% for file, data in files.items() %}
+      <div class="card mb-3">
+        <div class="card-header">
+          {{ file }} 
+          <a href="{{ url_for('get_agent_file', agent_id=agent_id, filename=file) }}" class="btn btn-sm btn-outline-primary float-end">Download</a>
+        </div>
+        <div class="card-body">
+          <pre>{% for line in data %}{{ line }}{% endfor %}</pre>
+        </div>
+      </div>
+    {% endfor %}
+    <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back to Dashboard</a>
+  </div>
+</body>
+</html>
